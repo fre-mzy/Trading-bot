@@ -169,14 +169,12 @@ def send_daily_digest_if_scheduled(conn):
         total = wins + losses
         win_rate = (wins / total * 100) if total > 0 else 0.0
 
-        digest = (
-            f"📊 **Daily Performance Digest (24h)**\n"
-            f"Trades Resolved: {total}\n"
-            f"Wins: {wins} ✅ | Losses: {losses} ❌\n"
-            f"Win Rate: {win_rate:.1f}%\n"
-            f"24h PnL: **${pnl_24h:+.2f}**\n"
-            f"Account Balance: **${balance:,.2f}**"
-        )
+        digest = f"""📊 **Daily Performance Digest (24h)**
+Trades Resolved: {total}
+Wins: {wins} ✅ | Losses: {losses} ❌
+Win Rate: {win_rate:.1f}%
+24h PnL: **${pnl_24h:+.2f}**
+Account Balance: **${balance:,.2f}**"""
         send_telegram_message(digest)
 
 # ---------------------------------------------------------------------------
@@ -312,14 +310,14 @@ def get_gemini_prediction(context):
 
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
 
-    user_prompt = (
-        f"{TRADING_GUIDELINES}\n\n"
-        f"Indicator Context:\n"
-        f"Signal Direction: {context['direction']}\n"
-        f"Macro Trend (1H EMA50): {context['macro_trend']} (EMA50: {context['h1_ema50']})\n"
-        f"5M EMA9: {context['ema9']} | 5M EMA21: {context['ema21']}\n"
-        f"5M RSI: {context['rsi']} | Price: {context['last_price']}\n"
-    )
+    user_prompt = f"""{TRADING_GUIDELINES}
+
+Indicator Context:
+Signal Direction: {context['direction']}
+Macro Trend (1H EMA50): {context['macro_trend']} (EMA50: {context['h1_ema50']})
+5M EMA9: {context['ema9']} | 5M EMA21: {context['ema21']}
+5M RSI: {context['rsi']} | Price: {context['last_price']}
+"""
 
     payload = {
         "contents": [{"parts": [{"text": user_prompt}]}],
@@ -397,12 +395,11 @@ def resolve_open_calls(conn, latest_candle):
             conn.commit()
 
             emoji = "✅" if result == "WIN" else "❌"
-            send_telegram_message(
-                f"{emoji} **Paper Trade Resolved ({result})**\n"
-                f"Direction: {direction} @ {entry:.2f}\n"
-                f"Exit Price: {close:.2f} | PnL: **${pnl_usd:+.2f}**\n"
-                f"Updated Balance: **${new_balance:,.2f}**"
-            )
+            msg = f"""{emoji} **Paper Trade Resolved ({result})**
+Direction: {direction} @ {entry:.2f}
+Exit Price: {close:.2f} | PnL: **${pnl_usd:+.2f}**
+Updated Balance: **${new_balance:,.2f}**"""
+            send_telegram_message(msg)
 
 # ---------------------------------------------------------------------------
 # 9. SINGLE EXECUTION RUN
@@ -465,14 +462,12 @@ def run_once():
         )
         conn.commit()
 
-        msg = (
-            f"🚀 **New Signal: {prediction['direction']} XAU/USD**\n"
-            f"Entry: `{entry:.2f}`\n"
-            f"TP: `{prediction['take_profit']:.2f}` | SL: `{stop_loss:.2f}`\n"
-            f"Position Size: `{units}` units (Risking ${risk_usd:.2f})\n"
-            f"Confidence: {prediction['confidence']}\n"
-            f"Reasoning: {prediction['reasoning']}"
-        )
+        msg = f"""🚀 **New Signal: {prediction['direction']} XAU/USD**
+Entry: `{entry:.2f}`
+TP: `{prediction['take_profit']:.2f}` | SL: `{stop_loss:.2f}`
+Position Size: `{units}` units (Risking ${risk_usd:.2f})
+Confidence: {prediction['confidence']}
+Reasoning: {prediction['reasoning']}"""
         send_telegram_message(msg)
         print(f"[SIGNAL GENERATED] {msg}")
     else:
@@ -494,12 +489,11 @@ def start_command_bot():
 
     @bot.message_handler(commands=['start', 'help'])
     def send_welcome(message):
-        help_text = (
-            "🤖 **Gold Trading Bot Commands:**\n\n"
-            "/status - View account balance & open positions count\n"
-            "/open - View currently active open trades\n"
-            "/stats - View all-time performance metrics"
-        )
+        help_text = f"""🤖 **Gold Trading Bot Commands:**
+
+/status - View account balance & open positions count
+/open - View currently active open trades
+/stats - View all-time performance metrics"""
         bot.reply_to(message, help_text, parse_mode="Markdown")
 
     @bot.message_handler(commands=['status'])
@@ -518,11 +512,9 @@ def start_command_bot():
         open_count = c.fetchone()[0]
         conn.close()
 
-        status_msg = (
-            f"💳 **Account Overview (Paper Trading)**\n"
-            f"Balance: **${balance:,.2f}**\n"
-            f"Active Open Positions: **{open_count}**"
-        )
+        status_msg = f"""💳 **Account Overview (Paper Trading)**
+Balance: **${balance:,.2f}**
+Active Open Positions: **{open_count}**"""
         bot.reply_to(message, status_msg, parse_mode="Markdown")
 
     @bot.message_handler(commands=['open'])
@@ -541,13 +533,13 @@ def start_command_bot():
             bot.reply_to(message, "🟢 No active open trades right now.")
             return
 
-        response = "📊 **Active Open Trades:**\n\
+        response = "📊 **Active Open Trades:**\n\n"
         for r in rows:
-            response += (
-                f"• **{r[0]} XAU/USD**\n"
-                f"  Entry: `{r[1]:.2f}` | TP: `{r[2]:.2f}` | SL: `{r[3]:.2f}`\n"
-                f"  Units: `{r[4]}` | Opened: {r[5][:16]}\n\n"
-            )
+            response += f"""• **{r[0]} XAU/USD**
+  Entry: `{r[1]:.2f}` | TP: `{r[2]:.2f}` | SL: `{r[3]:.2f}`
+  Units: `{r[4]}` | Opened: {r[5][:16]}
+
+"""
         bot.reply_to(message, response, parse_mode="Markdown")
 
     @bot.message_handler(commands=['stats'])
@@ -580,14 +572,13 @@ def start_command_bot():
         total_trades = wins + losses
         win_rate = (wins / total_trades * 100) if total_trades > 0 else 0.0
 
-        stats_msg = (
-            f"📈 **All-Time Performance Stats**\n"
-            f"Total Resolved Trades: {total_trades}\n"
-            f"Wins: {wins} ✅ | Losses: {losses} ❌\n"
-            f"Win Rate: **{win_rate:.1f}%**\n"
-            f"Total PnL: **${total_pnl:+.2f}**\n"
-            f"Current Balance: **${balance:,.2f}**"
-        )
+        stats_msg = f"""📈 **All-Time Performance Stats**
+Total Resolved Trades: {total_trades}
+Wins: {wins} ✅ | Losses: {losses} ❌
+Win Rate: **{win_rate:.1f}%**
+Total PnL: **${total_pnl:+.2f}**
+Current Balance: **${balance:,.2f}**"""
+
         bot.reply_to(message, stats_msg, parse_mode="Markdown")
 
     print("Interactive Telegram Bot started listening...")
