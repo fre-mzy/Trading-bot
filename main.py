@@ -1,31 +1,40 @@
 """
-Layer 1 — Continuous Watcher (GitHub Actions scheduled runner)
+Layer 1 & Layer 2 — Gold Trading Engine & Interactive Bot
 
 Features:
-- Weekend/Market Hours Guard (prevents unnecessary runs when Gold is closed)
-- Multi-Timeframe Confluence (5-min entry aligned with 1-hour EMA50 trend)
-- Detailed Reason Reporting (explains exactly why a trade was or wasn't taken)
-- High/Low wick-aware trade resolution against TP/SL levels
-- Gemini LLM risk validation
-- Telegram alerts & daily performance digest
+- Market Hours Guard (prevents unnecessary runs during weekend closures)
+- Multi-Timeframe Confluence (5m EMA 9/21 cross aligned with 1h EMA50 trend)
+- Detailed Rejection Reporting (sends clear skip reasons to Telegram)
+- Gemini LLM Risk Validation (evaluates candle structure & entry setup)
+- Paper Trading Engine ($10,000 baseline account tracking real PnL)
+- Interactive Telegram Commands (/status, /open, /stats)
 """
 
 import os
+import sys
 import json
 import sqlite3
 import requests
 from datetime import datetime, timezone
 
+# Optional Telegram bot library for interactive command handling
+try:
+    from telebot import TeleBot
+except ImportError:
+    TeleBot = None
+
 # ---------------------------------------------------------------------------
-# CONFIG (from environment / GitHub Secrets)
+# CONFIGURATION
 # ---------------------------------------------------------------------------
-TWELVE_DATA_API_KEY = os.environ["TWELVE_DATA_API_KEY"]
+TWELVE_DATA_API_KEY = os.environ.get("TWELVE_DATA_API_KEY")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 SYMBOL = "XAU/USD"
 DB_PATH = "signals_test.db"
+PAPER_STARTING_BALANCE = 10000.0  # $10,000 starting account balance
+RISK_PER_TRADE_PCT = 0.01         # 1% risk per trade
 
 TRADING_GUIDELINES = """You are validating a candidate trade setup for XAU/USD (gold vs USD).
 A rule-based filter has flagged this as a POSSIBLE candidate setup. Decide whether
@@ -66,7 +75,7 @@ def is_market_open():
     return True
 
 # ---------------------------------------------------------------------------
-# DATABASE SETUP & DAILY DIGEST
+# 2. DATABASE & PAPER TRADING SETUP
 # ---------------------------------------------------------------------------
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -79,6 +88,8 @@ def init_db():
             entry REAL,
             take_profit REAL,
             stop_loss REAL,
+            units REAL,
+            risk_usd REAL,
             confidence TEXT,
             reasoning TEXT
         )
@@ -90,44 +101,31 @@ def init_db():
             direction TEXT,
             entry REAL,
             exit_price REAL,
+            pnl_usd REAL,
             result TEXT,
             resolved_at TEXT
         )
     """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS account (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            balance REAL,
+            equity REAL
+        )
+    """)
+    c.execute(
+        "INSERT OR IGNORE INTO account (id, balance, equity) VALUES (1, ?, ?)",
+        (PAPER_STARTING_BALANCE, PAPER_STARTING_BALANCE),
+    )
     conn.commit()
     return conn
 
-def send_daily_digest_if_scheduled(conn):
-    """Sends a trade performance digest around 22:00 UTC daily."""
-    now = datetime.now(timezone.utc)
-    if now.hour == 22 and now.minute < 15:
-        c = conn.cursor()
-        c.execute("""
-            SELECT result, COUNT(*) 
-            FROM history 
-            WHERE resolved_at >= datetime('now', '-1 day')
-            GROUP BY result
-        """)
-        stats = dict(c.fetchall())
-        wins = stats.get("WIN", 0)
-        losses = stats.get("LOSS", 0)
-        total = wins + losses
-        win_rate = (wins / total * 100) if total > 0 else 0.0
-
-        digest = (
-            f"📊 **Daily Performance Digest (24h)**\n"
-            f"Resolved Trades: {total}\n"
-            f"Wins: {wins} ✅ | Losses: {losses} ❌\n"
-            f"Win Rate: {win_rate:.1f}%"
-        )
-        send_telegram_message(digest)
-
 # ---------------------------------------------------------------------------
-# NOTIFICATION (Telegram)
+# 3. NOTIFICATIONS & DAILY DIGEST
 # ---------------------------------------------------------------------------
 def send_telegram_message(text):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Telegram secrets missing — console log:")
+        print("Telegram configuration missing — standard console output:")
         print(text)
         return
 
@@ -136,12 +134,53 @@ def send_telegram_message(text):
     try:
         resp = requests.post(url, data=payload, timeout=10)
         if not resp.ok:
-            print("Telegram send failed:", resp.text)
+            print("Telegram dispatch failed:", resp.text)
     except requests.RequestException as e:
         print("Telegram request error:", e)
 
+def send_daily_digest_if_scheduled(conn):
+    """Sends a 24-hour performance digest around 22:00 UTC daily."""
+    now = datetime.now(timezone.utc)
+    if now.hour == 22 and now.minute < 15:
+        c = conn.cursor()
+        c.execute("""
+            SELECT result, SUM(pnl_usd), COUNT(*) 
+            FROM history 
+            WHERE resolved_at >= datetime('now', '-1 day')
+            GROUP BY result
+        """)
+        stats = c.fetchall()
+
+        c.execute("SELECT balance FROM account WHERE id = 1")
+        balance = c.fetchone()[0]
+
+        wins, losses = 0, 0
+        pnl_24h = 0.0
+
+        for row in stats:
+            res, pnl, count = row
+            if res == "WIN":
+                wins = count
+                pnl_24h += (pnl or 0.0)
+            elif res == "LOSS":
+                losses = count
+                pnl_24h += (pnl or 0.0)
+
+        total = wins + losses
+        win_rate = (wins / total * 100) if total > 0 else 0.0
+
+        digest = (
+            f"📊 **Daily Performance Digest (24h)**\n"
+            f"Trades Resolved: {total}\n"
+            f"Wins: {wins} ✅ | Losses: {losses} ❌\n"
+            f"Win Rate: {win_rate:.1f}%\n"
+            f"24h PnL: **${pnl_24h:+.2f}**\n"
+            f"Account Balance: **${balance:,.2f}**"
+        )
+        send_telegram_message(digest)
+
 # ---------------------------------------------------------------------------
-# DATA FETCH (Twelve Data)
+# 4. DATA FETCH (Twelve Data)
 # ---------------------------------------------------------------------------
 def fetch_candles(interval="5min", outputsize=100):
     url = "https://api.twelvedata.com/time_series"
@@ -165,7 +204,7 @@ def fetch_candles(interval="5min", outputsize=100):
     return list(reversed(data["values"]))
 
 # ---------------------------------------------------------------------------
-# TECHNICAL INDICATORS
+# 5. TECHNICAL INDICATORS
 # ---------------------------------------------------------------------------
 def ema(values, period):
     if len(values) < period:
@@ -194,19 +233,19 @@ def rsi(values, period=14):
     return 100 - (100 / (1 + rs))
 
 # ---------------------------------------------------------------------------
-# MULTI-TIMEFRAME CANDIDATE SCANNER (WITH EXPLICIT REASONING)
+# 6. SCANNER WITH REASONING
 # ---------------------------------------------------------------------------
 def is_candidate(m5_candles, h1_candles, conn):
     if len(m5_candles) < 22 or len(h1_candles) < 50:
         return False, {}, "Insufficient historical candle data."
 
-    # --- 1-Hour Trend Filter ---
+    # 1-Hour Trend Filter
     h1_closes = [float(v["close"]) for v in h1_candles]
     h1_ema50 = ema(h1_closes, 50)
     current_price = float(m5_candles[-1]["close"])
     macro_trend = "BULLISH" if current_price > h1_ema50 else "BEARISH"
 
-    # --- 5-Min Entry Signal ---
+    # 5-Min Entry Signal
     m5_closes = [float(v["close"]) for v in m5_candles]
     prev_ema9 = ema(m5_closes[:-1], 9)
     prev_ema21 = ema(m5_closes[:-1], 21)
@@ -221,23 +260,23 @@ def is_candidate(m5_candles, h1_candles, conn):
     bearish_cross = (prev_ema9 >= prev_ema21) and (curr_ema9 < curr_ema21)
     rsi_extreme = current_rsi > 65 or current_rsi < 35
 
-    # 1. Crossover evaluation
+    # Evaluation Step 1: Check for EMA Crossover
     if not (bullish_cross or bearish_cross):
-        return False, {}, f"No 5M EMA 9/21 crossover detected (RSI: {current_rsi:.1f}, 1H Macro Trend: {macro_trend})."
+        return False, {}, f"No 5M EMA 9/21 crossover detected (RSI: {current_rsi:.1f}, 1H Trend: {macro_trend})."
 
     signal_direction = "BUY" if bullish_cross else "SELL"
 
-    # 2. RSI extreme evaluation
+    # Evaluation Step 2: Check for RSI Extreme Condition
     if not rsi_extreme:
-        return False, {}, f"EMA 9/21 cross detected ({signal_direction}), but RSI ({current_rsi:.1f}) is not at an extreme level (>65 or <35)."
+        return False, {}, f"EMA 9/21 cross detected ({signal_direction}), but RSI ({current_rsi:.1f}) is not at extreme (>65 or <35)."
 
-    # 3. Multi-timeframe trend confluence evaluation
+    # Evaluation Step 3: Multi-Timeframe Trend Confluence
     if signal_direction == "BUY" and macro_trend != "BULLISH":
         return False, {}, f"5M BUY cross rejected: Conflicts with 1H Bearish Trend (Price {current_price:.2f} < 1H EMA50 {h1_ema50:.2f})."
     elif signal_direction == "SELL" and macro_trend != "BEARISH":
         return False, {}, f"5M SELL cross rejected: Conflicts with 1H Bullish Trend (Price {current_price:.2f} > 1H EMA50 {h1_ema50:.2f})."
 
-    # 4. Active open position evaluation
+    # Evaluation Step 4: Check Active Positions
     c = conn.cursor()
     c.execute("SELECT COUNT(*) FROM open_calls WHERE direction = ?", (signal_direction,))
     if c.fetchone()[0] > 0:
@@ -256,7 +295,7 @@ def is_candidate(m5_candles, h1_candles, conn):
     return True, context, "Candidate setup found."
 
 # ---------------------------------------------------------------------------
-# LLM VALIDATION (Gemini)
+# 7. LLM VALIDATION (Gemini)
 # ---------------------------------------------------------------------------
 def get_gemini_prediction(context):
     if not GEMINI_API_KEY:
@@ -300,18 +339,18 @@ def get_gemini_prediction(context):
         return None
 
     if not result.get("is_signal"):
-        rejection_msg = f"🔍 **Candidate Rejected by Gemini**\nReason: {result.get('reasoning', 'No specific reason provided.')}"
+        rejection_msg = f"🔍 **Candidate Rejected by Gemini**\nReason: {result.get('reasoning', 'No reason specified.')}"
         send_telegram_message(rejection_msg)
         return None
 
     return result
 
 # ---------------------------------------------------------------------------
-# OUTCOME TRACKING (Wick-Aware)
+# 8. PAPER TRADING OUTCOME TRACKER
 # ---------------------------------------------------------------------------
 def resolve_open_calls(conn, latest_candle):
     c = conn.cursor()
-    c.execute("SELECT id, timestamp, direction, entry, take_profit, stop_loss FROM open_calls")
+    c.execute("SELECT id, timestamp, direction, entry, take_profit, stop_loss, units, risk_usd FROM open_calls")
     open_rows = c.fetchall()
 
     if not open_rows:
@@ -321,53 +360,61 @@ def resolve_open_calls(conn, latest_candle):
     low = float(latest_candle["low"])
     close = float(latest_candle["close"])
 
+    c.execute("SELECT balance FROM account WHERE id = 1")
+    balance = c.fetchone()[0]
+
     for row in open_rows:
-        call_id, timestamp, direction, entry, take_profit, stop_loss = row
+        call_id, timestamp, direction, entry, take_profit, stop_loss, units, risk_usd = row
         result = None
+        pnl_usd = 0.0
 
         if direction == "BUY":
             if high >= take_profit:
                 result = "WIN"
+                pnl_usd = abs(take_profit - entry) * units
             elif low <= stop_loss:
                 result = "LOSS"
+                pnl_usd = -abs(entry - stop_loss) * units
         elif direction == "SELL":
             if low <= take_profit:
                 result = "WIN"
+                pnl_usd = abs(entry - take_profit) * units
             elif high >= stop_loss:
                 result = "LOSS"
+                pnl_usd = -abs(stop_loss - entry) * units
 
         if result:
+            new_balance = balance + pnl_usd
             resolved_at = datetime.now(timezone.utc).isoformat()
+
             c.execute(
-                """INSERT INTO history (timestamp, direction, entry, exit_price, result, resolved_at)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (timestamp, direction, entry, close, result, resolved_at),
+                """INSERT INTO history (timestamp, direction, entry, exit_price, pnl_usd, result, resolved_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (timestamp, direction, entry, close, pnl_usd, result, resolved_at),
             )
+            c.execute("UPDATE account SET balance = ?, equity = ? WHERE id = 1", (new_balance, new_balance))
             c.execute("DELETE FROM open_calls WHERE id = ?", (call_id,))
             conn.commit()
 
             emoji = "✅" if result == "WIN" else "❌"
             send_telegram_message(
-                f"{emoji} **Trade Resolved ({result})**\n"
-                f"Direction: {direction} @ {entry}\n"
-                f"Exit: {close} | TP: {take_profit} | SL: {stop_loss}"
+                f"{emoji} **Paper Trade Resolved ({result})**\n"
+                f"Direction: {direction} @ {entry:.2f}\n"
+                f"Exit Price: {close:.2f} | PnL: **${pnl_usd:+.2f}**\n"
+                f"Updated Balance: **${new_balance:,.2f}**"
             )
 
 # ---------------------------------------------------------------------------
-# SINGLE RUN EXECUTION
+# 9. SINGLE EXECUTION RUN
 # ---------------------------------------------------------------------------
 def run_once():
-    # 1. Market Hours Guard
     if not is_market_open():
-        print("Market is closed for the weekend. Exiting run.")
+        print("Market is closed for the weekend. Skipping execution.")
         return
 
     conn = init_db()
-
-    # 2. Daily Performance Digest
     send_daily_digest_if_scheduled(conn)
 
-    # 3. Fetch Candles (5m for entries, 1h for macro trend)
     m5_candles = fetch_candles(interval="5min", outputsize=100)
     h1_candles = fetch_candles(interval="1h", outputsize=100)
 
@@ -378,30 +425,40 @@ def run_once():
         conn.close()
         return
 
-    # 4. Resolve Open Calls
     resolve_open_calls(conn, m5_candles[-1])
 
-    # 5. Scan for MTF Confluence Candidates
     candidate, context, reason = is_candidate(m5_candles, h1_candles, conn)
 
     if candidate:
         prediction = get_gemini_prediction(context)
         if prediction is None:
-            # Gemini rejected trade — message already sent inside get_gemini_prediction()
             conn.close()
             return
 
         c = conn.cursor()
+        c.execute("SELECT balance FROM account WHERE id = 1")
+        balance = c.fetchone()[0]
+
+        # Lot sizing based on 1% account risk
+        entry = float(prediction["entry"])
+        stop_loss = float(prediction["stop_loss"])
+        sl_distance = abs(entry - stop_loss)
+        
+        risk_usd = balance * RISK_PER_TRADE_PCT
+        units = round(risk_usd / sl_distance, 2) if sl_distance > 0 else 1.0
+
         c.execute(
             """INSERT INTO open_calls
-               (timestamp, direction, entry, take_profit, stop_loss, confidence, reasoning)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+               (timestamp, direction, entry, take_profit, stop_loss, units, risk_usd, confidence, reasoning)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 datetime.now(timezone.utc).isoformat(),
                 prediction["direction"],
-                prediction["entry"],
+                entry,
                 prediction["take_profit"],
-                prediction["stop_loss"],
+                stop_loss,
+                units,
+                risk_usd,
                 prediction["confidence"],
                 prediction["reasoning"],
             ),
@@ -410,21 +467,78 @@ def run_once():
 
         msg = (
             f"🚀 **New Signal: {prediction['direction']} XAU/USD**\n"
-            f"Entry: `{prediction['entry']}`\n"
-            f"TP: `{prediction['take_profit']}` | SL: `{prediction['stop_loss']}`\n"
+            f"Entry: `{entry:.2f}`\n"
+            f"TP: `{prediction['take_profit']:.2f}` | SL: `{stop_loss:.2f}`\n"
+            f"Position Size: `{units}` units (Risking ${risk_usd:.2f})\n"
             f"Confidence: {prediction['confidence']}\n"
             f"Reasoning: {prediction['reasoning']}"
         )
         send_telegram_message(msg)
         print(f"[SIGNAL GENERATED] {msg}")
     else:
-        # Send no-trade status message with exact reason
         no_trade_msg = f"⚪ **No Trade Signal**\nReason: {reason}"
         send_telegram_message(no_trade_msg)
         print(f"[NO TRADE] {reason}")
 
     conn.close()
 
-if __name__ == "__main__":
-    run_once()
-  
+# ---------------------------------------------------------------------------
+# 10. INTERACTIVE BOT COMMAND HANDLER
+# ---------------------------------------------------------------------------
+def start_command_bot():
+    if not TELEGRAM_BOT_TOKEN or not TeleBot:
+        print("pyTelegramBotAPI or TELEGRAM_BOT_TOKEN not available.")
+        return
+
+    bot = TeleBot(TELEGRAM_BOT_TOKEN)
+
+    @bot.message_handler(commands=['start', 'help'])
+    def send_welcome(message):
+        help_text = (
+            "🤖 **Gold Trading Bot Commands:**\n\n"
+            "/status - View account balance & open positions count\n"
+            "/open - View currently active open trades\n"
+            "/stats - View all-time performance metrics"
+        )
+        bot.reply_to(message, help_text, parse_mode="Markdown")
+
+    @bot.message_handler(commands=['status'])
+    def handle_status(message):
+        if not os.path.exists(DB_PATH):
+            bot.reply_to(message, "⚠️ Database file not found.")
+            return
+
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT balance FROM account WHERE id = 1")
+        acc = c.fetchone()
+        balance = acc[0] if acc else PAPER_STARTING_BALANCE
+
+        c.execute("SELECT COUNT(*) FROM open_calls")
+        open_count = c.fetchone()[0]
+        conn.close()
+
+        status_msg = (
+            f"💳 **Account Overview (Paper Trading)**\n"
+            f"Balance: **${balance:,.2f}**\n"
+            f"Active Open Positions: **{open_count}**"
+        )
+        bot.reply_to(message, status_msg, parse_mode="Markdown")
+
+    @bot.message_handler(commands=['open'])
+    def handle_open(message):
+        if not os.path.exists(DB_PATH):
+            bot.reply_to(message, "⚠️ Database file not found.")
+            return
+
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT direction, entry, take_profit, stop_loss, units, timestamp FROM open_calls")
+        rows = c.fetchall()
+        conn.close()
+
+        if not rows:
+            bot.reply_to(message, "🟢 No active open trades right now.")
+            return
+
+        response = "📊 **Active Open Trades:**\n\
