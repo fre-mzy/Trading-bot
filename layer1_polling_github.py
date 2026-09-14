@@ -157,14 +157,35 @@ def get_stub_prediction(context):
     }
 
 # ---------------------------------------------------------------------------
-# NOTIFICATION (stubbed — prints for now, swap for Telegram later)
+# NOTIFICATION (real Telegram send)
 # ---------------------------------------------------------------------------
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+
+def send_telegram_message(text):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Telegram secrets missing — falling back to console print.")
+        print(text)
+        return
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
+    try:
+        resp = requests.post(url, data=payload, timeout=10)
+        if not resp.ok:
+            print("Telegram send failed:", resp.text)
+    except requests.RequestException as e:
+        print("Telegram send error:", e)
+
 def print_notification(prediction):
-    print(
-        f"[NOTIFY] Found a call -> {prediction['direction']} @ {prediction['entry']} "
-        f"| TP: {prediction['take_profit']} | SL: {prediction['stop_loss']} "
-        f"| ({prediction['confidence']})"
+    message = (
+        f"Found a call -> {prediction['direction']} @ {prediction['entry']}\n"
+        f"TP: {prediction['take_profit']} | SL: {prediction['stop_loss']}\n"
+        f"Confidence: {prediction['confidence']}\n"
+        f"Reasoning: {prediction['reasoning']}"
     )
+    send_telegram_message(message)
+    print(f"[NOTIFY] {message}")
 
 # ---------------------------------------------------------------------------
 # SINGLE RUN (called once per GitHub Actions trigger)
