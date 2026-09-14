@@ -2,7 +2,7 @@ name: Trading Signal Poll
 
 on:
   schedule:
-    # Every 15 minutes. GitHub queues scheduled runs, so timing isn't exact —
+    # Every 15 minutes. GitHub queues scheduled runs, so timing isn't exact â€”
     # fine for this use case, just don't expect second-level precision.
     - cron: "*/15 * * * *"
   workflow_dispatch: {}   # lets you trigger it manually from the Actions tab too
@@ -24,7 +24,7 @@ jobs:
 
       - name: Run polling script
         env:
-          ALPHA_VANTAGE_API_KEY: ${{ secrets.ALPHA_VANTAGE_API_KEY }}
+          TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
