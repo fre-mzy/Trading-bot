@@ -32,12 +32,15 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python main.py
 
+  
+
       - name: Commit & Push SQLite Updates
+        if: always()
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git pull --rebase origin main
           git add signals_test.db
-          git diff-index --quiet HEAD || git commit -m "chore: auto-update database [skip ci]"
+          git commit -m "chmod: update trade state database [skip ci]" || exit 0
           git push origin main
+          
           
