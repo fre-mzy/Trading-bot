@@ -197,9 +197,12 @@ def run_once():
     closes = fetch_candles()
     if not closes:
         print("No data returned this run.")
+        send_telegram_message("⚠️ Heartbeat: run completed but no price data returned.")
         return
 
     candidate, context = is_candidate(closes)
+    send_telegram_message(f"✅ Heartbeat: run completed. Candidate found: {candidate}")
+
     if candidate:
         prediction = get_stub_prediction(context)  # swap for get_claude_prediction(context) later
         c.execute(
@@ -225,3 +228,4 @@ def run_once():
 
 if __name__ == "__main__":
     run_once()
+    
