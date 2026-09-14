@@ -211,6 +211,10 @@ def get_gemini_prediction(context):
     try:
         resp = requests.post(url, json=payload, timeout=20)
         data = resp.json()
+        if "candidates" not in data:
+            print("Gemini returned no candidates:", data)
+            send_telegram_message(f"⚠️ Gemini raw response (no candidates): {data}")
+            return get_stub_prediction(context)
         raw_text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
         # Strip markdown code fences if the model added them anyway
         raw_text = raw_text.replace("```json", "").replace("```", "").strip()
@@ -309,4 +313,4 @@ def run_once():
 
 if __name__ == "__main__":
     run_once()
-    
+        
