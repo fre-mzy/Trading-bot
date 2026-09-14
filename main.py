@@ -542,3 +542,64 @@ def start_command_bot():
             return
 
         response = "📊 **Active Open Trades:**\n\
+        for r in rows:
+            response += (
+                f"• **{r[0]} XAU/USD**\n"
+                f"  Entry: `{r[1]:.2f}` | TP: `{r[2]:.2f}` | SL: `{r[3]:.2f}`\n"
+                f"  Units: `{r[4]}` | Opened: {r[5][:16]}\n\n"
+            )
+        bot.reply_to(message, response, parse_mode="Markdown")
+
+    @bot.message_handler(commands=['stats'])
+    def handle_stats(message):
+        if not os.path.exists(DB_PATH):
+            bot.reply_to(message, "⚠️ Database file not found.")
+            return
+
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT result, SUM(pnl_usd), COUNT(*) FROM history GROUP BY result")
+        stats = c.fetchall()
+
+        c.execute("SELECT balance FROM account WHERE id = 1")
+        balance = c.fetchone()[0]
+        conn.close()
+
+        wins, losses = 0, 0
+        total_pnl = 0.0
+
+        for row in stats:
+            res, pnl, count = row
+            if res == "WIN":
+                wins = count
+                total_pnl += (pnl or 0.0)
+            elif res == "LOSS":
+                losses = count
+                total_pnl += (pnl or 0.0)
+
+        total_trades = wins + losses
+        win_rate = (wins / total_trades * 100) if total_trades > 0 else 0.0
+
+        stats_msg = (
+            f"📈 **All-Time Performance Stats**\n"
+            f"Total Resolved Trades: {total_trades}\n"
+            f"Wins: {wins} ✅ | Losses: {losses} ❌\n"
+            f"Win Rate: **{win_rate:.1f}%**\n"
+            f"Total PnL: **${total_pnl:+.2f}**\n"
+            f"Current Balance: **${balance:,.2f}**"
+        )
+        bot.reply_to(message, stats_msg, parse_mode="Markdown")
+
+    print("Interactive Telegram Bot started listening...")
+    bot.infinity_polling()
+
+# ---------------------------------------------------------------------------
+# ENTRY POINT
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    # If launched with "--bot", start the interactive command handler.
+    # Otherwise, execute a standard single scheduled scan.
+    if len(sys.argv) > 1 and sys.argv[1] == "--bot":
+        start_command_bot()
+    else:
+        run_once()
