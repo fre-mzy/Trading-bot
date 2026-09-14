@@ -22,10 +22,9 @@ from datetime import datetime, timezone
 # ---------------------------------------------------------------------------
 # CONFIG (from environment / GitHub Secrets)
 # ---------------------------------------------------------------------------
-ALPHA_VANTAGE_API_KEY = os.environ["ALPHA_VANTAGE_API_KEY"]
+TWELVE_DATA_API_KEY = os.environ["TWELVE_DATA_API_KEY"]
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")  # optional until Layer 2 is wired in
-FROM_SYMBOL = "XAU"
-TO_SYMBOL = "USD"
+SYMBOL = "XAU/USD"
 DB_PATH = "signals_test.db"
 
 # ---------------------------------------------------------------------------
@@ -61,30 +60,27 @@ def init_db():
     return conn
 
 # ---------------------------------------------------------------------------
-# DATA FETCH (Alpha Vantage)
+# DATA FETCH (Twelve Data)
 # ---------------------------------------------------------------------------
 def fetch_candles():
-    url = "https://www.alphavantage.co/query"
+    url = "https://api.twelvedata.com/time_series"
     params = {
-        "function": "FX_INTRADAY",
-        "from_symbol": FROM_SYMBOL,
-        "to_symbol": TO_SYMBOL,
+        "symbol": SYMBOL,
         "interval": "5min",
-        "apikey": ALPHA_VANTAGE_API_KEY,
-        "outputsize": "compact",
+        "outputsize": 100,
+        "apikey": TWELVE_DATA_API_KEY,
     }
     resp = requests.get(url, params=params, timeout=15)
     data = resp.json()
 
-    series_key = "Time Series FX (5min)"
-    if series_key not in data:
+    if "values" not in data:
         print("Unexpected response (rate limit or bad key?):", data)
-        send_telegram_message(f"⚠️ Alpha Vantage error: {data}")
+        send_telegram_message(f"⚠️ Twelve Data error: {data}")
         return []
 
-    series = data[series_key]
-    timestamps = sorted(series.keys())
-    closes = [float(series[t]["4. close"]) for t in timestamps]
+    # Twelve Data returns newest-first; reverse so oldest is first, newest last
+    values = list(reversed(data["values"]))
+    closes = [float(v["close"]) for v in values]
     return closes
 
 # ---------------------------------------------------------------------------
