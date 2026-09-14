@@ -1,9 +1,9 @@
 name: Poll Trading Signals
 
 on:
+  workflow_dispatch: # Keeps manual trigger available
   schedule:
-    - cron: '*/10 * * * *' # Every 10 minutes
-  workflow_dispatch:
+    - cron: '*/5 * * * *' # Runs automatically every 5 minutes
 
 jobs:
   run-watcher:
