@@ -79,6 +79,7 @@ def fetch_candles():
     series_key = "Time Series FX (5min)"
     if series_key not in data:
         print("Unexpected response (rate limit or bad key?):", data)
+        send_telegram_message(f"⚠️ Alpha Vantage error: {data}")
         return []
 
     series = data[series_key]
