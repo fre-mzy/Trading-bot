@@ -136,7 +136,7 @@ def is_candidate(closes):
     return (crossover and rsi_extreme), context
 
 # ---------------------------------------------------------------------------
-# STUBBED PREDICTION (use this until Layer 2 / Claude is wired in)
+# STUBBED PREDICTION (kept for offline testing / fallback)
 # ---------------------------------------------------------------------------
 def get_stub_prediction(context):
     direction = "BUY" if context["ema9"] > context["ema21"] else "SELL"
@@ -151,6 +151,86 @@ def get_stub_prediction(context):
         "stop_loss": stop_loss,
         "confidence": "test-stub",
         "reasoning": "Stubbed response for pipeline testing — not a real signal.",
+    }
+
+# ---------------------------------------------------------------------------
+# FREE LLM VALIDATION (Google Gemini) — stand-in for Claude while testing
+# ---------------------------------------------------------------------------
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+
+TRADING_GUIDELINES = """You are validating a candidate trade setup for XAU/USD (gold vs USD).
+A rule-based filter has already flagged this as a POSSIBLE candidate. Decide whether
+it's a genuine setup, and if so, provide exact trade parameters.
+
+Risk rules:
+- Stop loss must be based on a sensible level or ATR-style distance, not a round guess.
+- Take profit should reflect at least a 1:1.5 reward-to-risk ratio versus the stop loss.
+- If you can't justify a stop loss with reasonable confidence, reject the candidate.
+
+Respond with ONLY a JSON object, no other text, no markdown formatting, in exactly
+this shape:
+{
+  "is_signal": true or false,
+  "direction": "BUY" or "SELL" or null,
+  "entry": number or null,
+  "take_profit": number or null,
+  "stop_loss": number or null,
+  "confidence": "low" | "medium" | "high" or null,
+  "reasoning": "1-3 sentences"
+}
+"""
+
+def get_gemini_prediction(context):
+    """
+    Free-tier stand-in for the real Claude validation call.
+    Uses Google's Gemini API (free key from aistudio.google.com).
+    """
+    if not GEMINI_API_KEY:
+        print("No Gemini key set — falling back to stub.")
+        return get_stub_prediction(context)
+
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+    )
+
+    user_prompt = (
+        f"{TRADING_GUIDELINES}\n\n"
+        f"Current indicator readings:\n"
+        f"EMA9: {context['ema9']}\n"
+        f"EMA21: {context['ema21']}\n"
+        f"RSI: {context['rsi']}\n"
+        f"Last price: {context['last_price']}\n"
+    )
+
+    payload = {
+        "contents": [{"parts": [{"text": user_prompt}]}],
+        "generationConfig": {"temperature": 0.2},
+    }
+
+    try:
+        resp = requests.post(url, json=payload, timeout=20)
+        data = resp.json()
+        raw_text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        # Strip markdown code fences if the model added them anyway
+        raw_text = raw_text.replace("```json", "").replace("```", "").strip()
+        result = json.loads(raw_text)
+    except Exception as e:
+        print("Gemini call/parse failed:", e)
+        send_telegram_message(f"⚠️ Gemini validation failed, falling back to stub: {e}")
+        return get_stub_prediction(context)
+
+    if not result.get("is_signal"):
+        print("Gemini declined this candidate:", result.get("reasoning"))
+        return None
+
+    return {
+        "direction": result["direction"],
+        "entry": result["entry"],
+        "take_profit": result["take_profit"],
+        "stop_loss": result["stop_loss"],
+        "confidence": result["confidence"],
+        "reasoning": result["reasoning"],
     }
 
 # ---------------------------------------------------------------------------
@@ -201,7 +281,11 @@ def run_once():
     send_telegram_message(f"✅ Heartbeat: run completed. Candidate found: {candidate}")
 
     if candidate:
-        prediction = get_stub_prediction(context)  # swap for get_claude_prediction(context) later
+        prediction = get_gemini_prediction(context)
+        if prediction is None:
+            print("Candidate found but validation rejected it — no call recorded.")
+            conn.close()
+            return
         c.execute(
             """INSERT INTO open_calls
                (timestamp, direction, entry, take_profit, stop_loss, confidence, reasoning)
