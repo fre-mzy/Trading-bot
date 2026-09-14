@@ -1,0 +1,37 @@
+name: Trading Signal Poll
+
+on:
+  schedule:
+    # Every 15 minutes. GitHub queues scheduled runs, so timing isn't exact —
+    # fine for this use case, just don't expect second-level precision.
+    - cron: "*/15 * * * *"
+  workflow_dispatch: {}   # lets you trigger it manually from the Actions tab too
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run polling script
+        env:
+          ALPHA_VANTAGE_API_KEY: ${{ secrets.ALPHA_VANTAGE_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: python layer1_polling_github.py
+
+      - name: Commit updated database back to repo
+        run: |
+          git config user.name "trading-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add signals_test.db
+          git diff --quiet --cached || git commit -m "Update signal database [skip ci]"
+          git push
