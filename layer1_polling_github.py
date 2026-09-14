@@ -226,6 +226,9 @@ def get_gemini_prediction(context):
 
     if not result.get("is_signal"):
         print("Gemini declined this candidate:", result.get("reasoning"))
+        send_telegram_message(
+            f"🔍 Candidate checked, no call taken.\nReasoning: {result.get('reasoning')}"
+        )
         return None
 
     return {
@@ -269,6 +272,47 @@ def print_notification(prediction):
     print(f"[NOTIFY] {message}")
 
 # ---------------------------------------------------------------------------
+# OUTCOME TRACKING (Layer 3 — resolve open calls against TP/SL)
+# ---------------------------------------------------------------------------
+def resolve_open_calls(conn, current_price):
+    c = conn.cursor()
+    c.execute("SELECT id, timestamp, direction, entry, take_profit, stop_loss FROM open_calls")
+    open_rows = c.fetchall()
+
+    for row in open_rows:
+        call_id, timestamp, direction, entry, take_profit, stop_loss = row
+        result = None
+
+        if direction == "BUY":
+            if current_price >= take_profit:
+                result = "WIN"
+            elif current_price <= stop_loss:
+                result = "LOSS"
+        elif direction == "SELL":
+            if current_price <= take_profit:
+                result = "WIN"
+            elif current_price >= stop_loss:
+                result = "LOSS"
+
+        if result:
+            resolved_at = datetime.now(timezone.utc).isoformat()
+            c.execute(
+                """INSERT INTO history (timestamp, direction, entry, exit_price, result, resolved_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (timestamp, direction, entry, current_price, result, resolved_at),
+            )
+            c.execute("DELETE FROM open_calls WHERE id = ?", (call_id,))
+            conn.commit()
+
+            emoji = "✅" if result == "WIN" else "❌"
+            send_telegram_message(
+                f"{emoji} {result} — {direction} call from {timestamp}\n"
+                f"Entry: {entry} | Exit: {current_price}\n"
+                f"(TP: {take_profit} | SL: {stop_loss})"
+            )
+            print(f"Resolved call {call_id} as {result}")
+
+# ---------------------------------------------------------------------------
 # SINGLE RUN (called once per GitHub Actions trigger)
 # ---------------------------------------------------------------------------
 def run_once():
@@ -280,6 +324,9 @@ def run_once():
         print("No data returned this run.")
         send_telegram_message("⚠️ Heartbeat: run completed but no price data returned.")
         return
+
+    # Check any existing open calls against the latest price before looking for new ones
+    resolve_open_calls(conn, closes[-1])
 
     candidate, context = is_candidate(closes)
     send_telegram_message(f"✅ Heartbeat: run completed. Candidate found: {candidate}")
@@ -313,4 +360,4 @@ def run_once():
 
 if __name__ == "__main__":
     run_once()
-        
+    
