@@ -191,7 +191,7 @@ def get_gemini_prediction(context):
 
     url = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+        f"gemini-3.6-flash:generateContent?key={GEMINI_API_KEY}"
     )
 
     user_prompt = (
