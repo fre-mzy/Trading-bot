@@ -1,16 +1,10 @@
 """
-Layer 1 — Continuous Watcher (GitHub Actions version)
+Layer 1 — Continuous Watcher (GitHub Actions scheduled runner)
 
-Unlike the original always-running loop, this version runs ONCE per invocation
-and exits — GitHub Actions triggers it on a schedule (e.g. every 5-15 minutes)
-instead of it looping forever on a server.
-
-Database persistence: since each GitHub Actions run starts on a fresh machine,
-signals_test.db is committed back into the repo at the end of each run by the
-workflow (see .github/workflows/poll.yml) so history carries over between runs.
-
-API keys are read from environment variables, which GitHub Actions injects
-from repo Secrets (never hardcoded, never committed).
+This script executes once per invocation on a GitHub Actions schedule (e.g., every 5–15 mins).
+It fetches candle data from Twelve Data, verifies candle wicks to resolve open TP/SL calls,
+scans for new EMA/RSI crossover signals, validates candidate setups via Google Gemini,
+logs open calls/history into SQLite, and sends notifications via Telegram.
 """
 
 import os
@@ -23,9 +17,33 @@ from datetime import datetime, timezone
 # CONFIG (from environment / GitHub Secrets)
 # ---------------------------------------------------------------------------
 TWELVE_DATA_API_KEY = os.environ["TWELVE_DATA_API_KEY"]
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")  # optional until Layer 2 is wired in
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+
 SYMBOL = "XAU/USD"
 DB_PATH = "signals_test.db"
+
+TRADING_GUIDELINES = """You are validating a candidate trade setup for XAU/USD (gold vs USD).
+A rule-based filter has flagged this as a POSSIBLE candidate setup. Decide whether
+it's a genuine setup, and if so, provide exact trade parameters.
+
+Risk rules:
+- Stop loss must be based on a sensible level or ATR-style distance, not a round guess.
+- Take profit should reflect at least a 1:1.5 reward-to-risk ratio versus the stop loss.
+- If you can't justify a stop loss with reasonable confidence, reject the candidate.
+
+Respond with ONLY a valid JSON object matching this schema exactly:
+{
+  "is_signal": true or false,
+  "direction": "BUY" or "SELL" or null,
+  "entry": number or null,
+  "take_profit": number or null,
+  "stop_loss": number or null,
+  "confidence": "low" | "medium" | "high" or null,
+  "reasoning": "1-3 sentences"
+}
+"""
 
 # ---------------------------------------------------------------------------
 # DATABASE SETUP
@@ -60,6 +78,24 @@ def init_db():
     return conn
 
 # ---------------------------------------------------------------------------
+# NOTIFICATION (Telegram)
+# ---------------------------------------------------------------------------
+def send_telegram_message(text):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Telegram secrets missing — printing to console:")
+        print(text)
+        return
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
+    try:
+        resp = requests.post(url, data=payload, timeout=10)
+        if not resp.ok:
+            print("Telegram send failed:", resp.text)
+    except requests.RequestException as e:
+        print("Telegram send error:", e)
+
+# ---------------------------------------------------------------------------
 # DATA FETCH (Twelve Data)
 # ---------------------------------------------------------------------------
 def fetch_candles():
@@ -70,21 +106,25 @@ def fetch_candles():
         "outputsize": 100,
         "apikey": TWELVE_DATA_API_KEY,
     }
-    resp = requests.get(url, params=params, timeout=15)
-    data = resp.json()
+    try:
+        resp = requests.get(url, params=params, timeout=15)
+        data = resp.json()
+    except Exception as e:
+        print("Twelve Data HTTP request error:", e)
+        send_telegram_message(f"⚠️ Twelve Data request exception: {e}")
+        return []
 
     if "values" not in data:
-        print("Unexpected response (rate limit or bad key?):", data)
+        print("Unexpected response from Twelve Data:", data)
         send_telegram_message(f"⚠️ Twelve Data error: {data}")
         return []
 
-    # Twelve Data returns newest-first; reverse so oldest is first, newest last
-    values = list(reversed(data["values"]))
-    closes = [float(v["close"]) for v in values]
-    return closes
+    # Reverse list so array is chronological: oldest -> index 0, latest -> index -1
+    candles = list(reversed(data["values"]))
+    return candles
 
 # ---------------------------------------------------------------------------
-# INDICATORS
+# TECHNICAL INDICATORS
 # ---------------------------------------------------------------------------
 def ema(values, period):
     if len(values) < period:
@@ -113,38 +153,60 @@ def rsi(values, period=14):
     return 100 - (100 / (1 + rs))
 
 # ---------------------------------------------------------------------------
-# CANDIDATE FILTER
+# CANDIDATE FILTER WITH DUPLICATE PROTECTION
 # ---------------------------------------------------------------------------
-def is_candidate(closes):
-    ema9 = ema(closes, 9)
-    ema21 = ema(closes, 21)
-    current_rsi = rsi(closes)
-
-    if ema9 is None or ema21 is None or current_rsi is None:
+def is_candidate(candles, conn):
+    if len(candles) < 22:
         return False, {}
 
-    crossover = ema9 > ema21
+    closes = [float(v["close"]) for v in candles]
+
+    # Calculate previous and current EMAs to verify a true cross event
+    prev_ema9 = ema(closes[:-1], 9)
+    prev_ema21 = ema(closes[:-1], 21)
+    curr_ema9 = ema(closes, 9)
+    curr_ema21 = ema(closes, 21)
+    current_rsi = rsi(closes)
+
+    if None in (prev_ema9, prev_ema21, curr_ema9, curr_ema21, current_rsi):
+        return False, {}
+
+    bullish_cross = (prev_ema9 <= prev_ema21) and (curr_ema9 > curr_ema21)
+    bearish_cross = (prev_ema9 >= prev_ema21) and (curr_ema9 < curr_ema21)
     rsi_extreme = current_rsi > 65 or current_rsi < 35
 
+    candidate = (bullish_cross or bearish_cross) and rsi_extreme
+    direction = "BUY" if bullish_cross else "SELL"
+
+    # Prevent duplicate position generation if an open position already exists
+    if candidate:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM open_calls WHERE direction = ?", (direction,))
+        if c.fetchone()[0] > 0:
+            print(f"Skipping signal: Existing open {direction} call already active in DB.")
+            return False, {}
+
     context = {
-        "ema9": round(ema9, 4),
-        "ema21": round(ema21, 4),
+        "ema9": round(curr_ema9, 4),
+        "ema21": round(curr_ema21, 4),
         "rsi": round(current_rsi, 2),
         "last_price": closes[-1],
+        "direction": direction,
     }
 
-    return (crossover and rsi_extreme), context
+    return candidate, context
 
 # ---------------------------------------------------------------------------
-# STUBBED PREDICTION (kept for offline testing / fallback)
+# STUBBED PREDICTION (Fallback)
 # ---------------------------------------------------------------------------
 def get_stub_prediction(context):
-    direction = "BUY" if context["ema9"] > context["ema21"] else "SELL"
+    direction = context.get("direction", "BUY")
     entry = context["last_price"]
     take_profit = round(entry * 1.01, 4) if direction == "BUY" else round(entry * 0.99, 4)
     stop_loss = round(entry * 0.995, 4) if direction == "BUY" else round(entry * 1.005, 4)
 
     return {
+        "is_signal": True,
         "direction": direction,
         "entry": entry,
         "take_profit": take_profit,
@@ -154,144 +216,87 @@ def get_stub_prediction(context):
     }
 
 # ---------------------------------------------------------------------------
-# FREE LLM VALIDATION (Google Gemini) — stand-in for Claude while testing
+# GEMINI LLM VALIDATION
 # ---------------------------------------------------------------------------
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-
-TRADING_GUIDELINES = """You are validating a candidate trade setup for XAU/USD (gold vs USD).
-A rule-based filter has already flagged this as a POSSIBLE candidate. Decide whether
-it's a genuine setup, and if so, provide exact trade parameters.
-
-Risk rules:
-- Stop loss must be based on a sensible level or ATR-style distance, not a round guess.
-- Take profit should reflect at least a 1:1.5 reward-to-risk ratio versus the stop loss.
-- If you can't justify a stop loss with reasonable confidence, reject the candidate.
-
-Respond with ONLY a JSON object, no other text, no markdown formatting, in exactly
-this shape:
-{
-  "is_signal": true or false,
-  "direction": "BUY" or "SELL" or null,
-  "entry": number or null,
-  "take_profit": number or null,
-  "stop_loss": number or null,
-  "confidence": "low" | "medium" | "high" or null,
-  "reasoning": "1-3 sentences"
-}
-"""
-
 def get_gemini_prediction(context):
-    """
-    Free-tier stand-in for the real Claude validation call.
-    Uses Google's Gemini API (free key from aistudio.google.com).
-    """
     if not GEMINI_API_KEY:
-        print("No Gemini key set — falling back to stub.")
+        print("No Gemini API Key found. Falling back to stub prediction.")
         return get_stub_prediction(context)
 
-    url = (
-        "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"gemini-3.6-flash:generateContent?key={GEMINI_API_KEY}"
-    )
+    # Standard v1beta Flash endpoint
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
 
     user_prompt = (
         f"{TRADING_GUIDELINES}\n\n"
-        f"Current indicator readings:\n"
+        f"Candidate Indicator Context:\n"
+        f"Direction Bias: {context['direction']}\n"
         f"EMA9: {context['ema9']}\n"
         f"EMA21: {context['ema21']}\n"
         f"RSI: {context['rsi']}\n"
-        f"Last price: {context['last_price']}\n"
+        f"Last Price: {context['last_price']}\n"
     )
 
     payload = {
         "contents": [{"parts": [{"text": user_prompt}]}],
-        "generationConfig": {"temperature": 0.2},
+        "generationConfig": {
+            "temperature": 0.1,
+            "response_mime_type": "application/json"
+        },
     }
 
     try:
         resp = requests.post(url, json=payload, timeout=20)
         data = resp.json()
+
         if "candidates" not in data:
-            print("Gemini returned no candidates:", data)
-            send_telegram_message(f"⚠️ Gemini raw response (no candidates): {data}")
+            print("Gemini response missing candidates:", data)
+            send_telegram_message(f"⚠️ Gemini error/rate limit: {data}")
             return get_stub_prediction(context)
+
         raw_text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-        # Strip markdown code fences if the model added them anyway
-        raw_text = raw_text.replace("```json", "").replace("```", "").strip()
         result = json.loads(raw_text)
     except Exception as e:
-        print("Gemini call/parse failed:", e)
-        send_telegram_message(f"⚠️ Gemini validation failed, falling back to stub: {e}")
+        print("Gemini API or JSON parse error:", e)
+        send_telegram_message(f"⚠️ Gemini validation failed: {e}")
         return get_stub_prediction(context)
 
     if not result.get("is_signal"):
-        print("Gemini declined this candidate:", result.get("reasoning"))
+        print("Gemini declined candidate signal:", result.get("reasoning"))
         send_telegram_message(
-            f"🔍 Candidate checked, no call taken.\nReasoning: {result.get('reasoning')}"
+            f"🔍 Candidate rejected by Gemini.\nReasoning: {result.get('reasoning')}"
         )
         return None
 
-    return {
-        "direction": result["direction"],
-        "entry": result["entry"],
-        "take_profit": result["take_profit"],
-        "stop_loss": result["stop_loss"],
-        "confidence": result["confidence"],
-        "reasoning": result["reasoning"],
-    }
+    return result
 
 # ---------------------------------------------------------------------------
-# NOTIFICATION (real Telegram send)
+# OUTCOME TRACKING (Wick-Aware High/Low Resolution)
 # ---------------------------------------------------------------------------
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-
-def send_telegram_message(text):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Telegram secrets missing — falling back to console print.")
-        print(text)
-        return
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
-    try:
-        resp = requests.post(url, data=payload, timeout=10)
-        if not resp.ok:
-            print("Telegram send failed:", resp.text)
-    except requests.RequestException as e:
-        print("Telegram send error:", e)
-
-def print_notification(prediction):
-    message = (
-        f"Found a call -> {prediction['direction']} @ {prediction['entry']}\n"
-        f"TP: {prediction['take_profit']} | SL: {prediction['stop_loss']}\n"
-        f"Confidence: {prediction['confidence']}\n"
-        f"Reasoning: {prediction['reasoning']}"
-    )
-    send_telegram_message(message)
-    print(f"[NOTIFY] {message}")
-
-# ---------------------------------------------------------------------------
-# OUTCOME TRACKING (Layer 3 — resolve open calls against TP/SL)
-# ---------------------------------------------------------------------------
-def resolve_open_calls(conn, current_price):
+def resolve_open_calls(conn, latest_candle):
     c = conn.cursor()
     c.execute("SELECT id, timestamp, direction, entry, take_profit, stop_loss FROM open_calls")
     open_rows = c.fetchall()
+
+    if not open_rows:
+        return
+
+    high_price = float(latest_candle["high"])
+    low_price = float(latest_candle["low"])
+    close_price = float(latest_candle["close"])
 
     for row in open_rows:
         call_id, timestamp, direction, entry, take_profit, stop_loss = row
         result = None
 
         if direction == "BUY":
-            if current_price >= take_profit:
+            if high_price >= take_profit:
                 result = "WIN"
-            elif current_price <= stop_loss:
+            elif low_price <= stop_loss:
                 result = "LOSS"
         elif direction == "SELL":
-            if current_price <= take_profit:
+            if low_price <= take_profit:
                 result = "WIN"
-            elif current_price >= stop_loss:
+            elif high_price >= stop_loss:
                 result = "LOSS"
 
         if result:
@@ -299,44 +304,48 @@ def resolve_open_calls(conn, current_price):
             c.execute(
                 """INSERT INTO history (timestamp, direction, entry, exit_price, result, resolved_at)
                    VALUES (?, ?, ?, ?, ?, ?)""",
-                (timestamp, direction, entry, current_price, result, resolved_at),
+                (timestamp, direction, entry, close_price, result, resolved_at),
             )
             c.execute("DELETE FROM open_calls WHERE id = ?", (call_id,))
             conn.commit()
 
             emoji = "✅" if result == "WIN" else "❌"
             send_telegram_message(
-                f"{emoji} {result} — {direction} call from {timestamp}\n"
-                f"Entry: {entry} | Exit: {current_price}\n"
+                f"{emoji} {result} — {direction} call resolved\n"
+                f"Entry: {entry} | Exit: {close_price}\n"
                 f"(TP: {take_profit} | SL: {stop_loss})"
             )
             print(f"Resolved call {call_id} as {result}")
 
 # ---------------------------------------------------------------------------
-# SINGLE RUN (called once per GitHub Actions trigger)
+# SINGLE RUN INVOCATION
 # ---------------------------------------------------------------------------
 def run_once():
     conn = init_db()
-    c = conn.cursor()
 
-    closes = fetch_candles()
-    if not closes:
-        print("No data returned this run.")
-        send_telegram_message("⚠️ Heartbeat: run completed but no price data returned.")
+    candles = fetch_candles()
+    if not candles:
+        print("No price candles retrieved this run.")
+        send_telegram_message("⚠️ Heartbeat: run completed but no price data was retrieved.")
+        conn.close()
         return
 
-    # Check any existing open calls against the latest price before looking for new ones
-    resolve_open_calls(conn, closes[-1])
+    latest_candle = candles[-1]
+    
+    # 1. Resolve open trades using current candle High / Low wicks
+    resolve_open_calls(conn, latest_candle)
 
-    candidate, context = is_candidate(closes)
-    send_telegram_message(f"✅ Heartbeat: run completed. Candidate found: {candidate}")
+    # 2. Check technical scanner for a crossover candidate
+    candidate, context = is_candidate(candles, conn)
 
     if candidate:
         prediction = get_gemini_prediction(context)
         if prediction is None:
-            print("Candidate found but validation rejected it — no call recorded.")
+            print("Candidate flagged, but LLM validation rejected the setup.")
             conn.close()
             return
+
+        c = conn.cursor()
         c.execute(
             """INSERT INTO open_calls
                (timestamp, direction, entry, take_profit, stop_loss, confidence, reasoning)
@@ -352,9 +361,17 @@ def run_once():
             ),
         )
         conn.commit()
-        print_notification(prediction)
+
+        message = (
+            f"🚀 Signal Generated -> {prediction['direction']} @ {prediction['entry']}\n"
+            f"TP: {prediction['take_profit']} | SL: {prediction['stop_loss']}\n"
+            f"Confidence: {prediction['confidence']}\n"
+            f"Reasoning: {prediction['reasoning']}"
+        )
+        send_telegram_message(message)
+        print(f"[SIGNAL ACCEPTED] {message}")
     else:
-        print(f"[{datetime.now(timezone.utc).isoformat()}] No candidate this run.")
+        print(f"[{datetime.now(timezone.utc).isoformat()}] No candidate detected on this run.")
 
     conn.close()
 
