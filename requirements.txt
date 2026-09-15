@@ -1,5 +1,5 @@
-requests
 pandas
 numpy
+requests
 google-generativeai
 pyTelegramBotAPI
