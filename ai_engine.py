@@ -106,7 +106,7 @@ def evaluate_trade_with_gemini(
     user_message = f"Market Payload:\n```json\n{json.dumps(payload, indent=2)}\n```"
 
     try:
-        model = genai.GenerativeModel("gemini-1.5-flash")
+        model = genai.GenerativeModel("gemini-2.5-flash")
         
         response = model.generate_content(
             f"{system_prompt}\n\n{user_message}",
