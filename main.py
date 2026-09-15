@@ -43,11 +43,17 @@ def fetch_market_data(symbol: str = "XAU/USD", interval: str = "5min", outputsiz
 
     df = pd.DataFrame(data["values"])
     df["datetime"] = pd.to_datetime(df["datetime"])
+
+    # Handle missing volume key from XAU/USD API payload
+    if "volume" not in df.columns:
+        df["volume"] = 0.0
+
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = df[col].astype(float)
 
     df = df.sort_values("datetime").reset_index(drop=True)
     return df
+
 
 def fetch_live_spread(symbol: str = "XAU/USD") -> float:
     """Fetches live bid/ask spread in points."""
