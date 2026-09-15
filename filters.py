@@ -7,6 +7,9 @@ def is_rollover_window() -> bool:
     rollover_start = datetime.strptime("21:45", "%H:%M").time()
     rollover_end = datetime.strptime("23:00", "%H:%M").time()
     
+    # FIXED: Use chained comparison (AND logic) for same-day time window
+    return rollover_start <= now_utc <= rollover_end
+
     return rollover_start <= now_utc or now_utc <= rollover_end
 
 def check_spread(spread_points: float, max_allowed: float = 0.35) -> tuple[bool, str]:
