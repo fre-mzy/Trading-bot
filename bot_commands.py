@@ -1,117 +1,89 @@
-"""
-Telegram Command Handler Bot
-Runs continuously to answer /status, /open, and /stats queries.
-"""
+"""Telegram commands (/status /open /stats) without needing a server.
 
+Each pipeline run (every ~5 min in GitHub Actions) calls process_pending_commands(), which reads
+any new messages via getUpdates and replies. Expect answers within about 5 minutes. Only the chat
+in TELEGRAM_CHAT_ID is answered. You can still run `python bot_commands.py` on an always-on machine
+to poll continuously if you want instant replies."""
+import logging
 import os
-import sqlite3
+import time
+
 import requests
-from telebot import TeleBot
 
-TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-DB_PATH = "signals_test.db"
+import db
+from notify import send_telegram
 
-bot = TeleBot(TELEGRAM_BOT_TOKEN)
+HELP = ("Gold paper-trading bot\n/status - balance and open trades\n"
+        "/open - open positions\n/stats - all-time win/loss stats")
 
-@bot.message_handler(commands=['start', 'help'])
-def send_welcome(message):
-    help_text = (
-        "🤖 **Gold Trading Bot Interactive Commands:**\n\n"
-        "/status - Show account balance & current performance\n"
-        "/open - View currently active positions\n"
-        "/stats - View all-time win/loss statistics"
-    )
-    bot.reply_to(message, help_text, parse_mode="Markdown")
 
-@bot.message_handler(commands=['status'])
-def handle_status(message):
-    if not os.path.exists(DB_PATH):
-        bot.reply_to(message, "⚠️ Database file not found.")
-        return
+def render_status() -> str:
+    return (f"Account (paper trading)\nBalance: ${db.get_balance():,.2f}\n"
+            f"Open trades: {len(db.get_open_calls())}")
 
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT balance FROM account WHERE id = 1")
-    acc = c.fetchone()
-    balance = acc[0] if acc else 10000.0
 
-    c.execute("SELECT COUNT(*) FROM open_calls")
-    open_count = c.fetchone()[0]
+def render_open() -> str:
+    calls = db.get_open_calls()
+    if not calls:
+        return "No open positions."
+    lines = ["Open positions:"]
+    for c in calls:
+        lines.append(f"- {c['direction']} XAU/USD  entry {c['entry']}  TP {c['take_profit']}  "
+                     f"SL {c['stop_loss']}  opened {str(c['timestamp'])[:16]} UTC")
+    return "\n".join(lines)
 
-    conn.close()
 
-    status_msg = (
-        f"💳 **Account Overview (Paper Trading)**\n"
-        f"Balance: **${balance:,.2f}**\n"
-        f"Active Open Trades: **{open_count}**"
-    )
-    bot.reply_to(message, status_msg, parse_mode="Markdown")
+def render_stats() -> str:
+    s = db.get_stats()
+    return (f"All-time paper stats\nTrades: {s['total']}\nWins: {s['wins']} | Losses: {s['losses']}\n"
+            f"Win rate: {s['win_rate']:.1f}%\nNet PnL: ${s['net_pnl']:+,.2f}\nBalance: ${s['balance']:,.2f}")
 
-@bot.message_handler(commands=['open'])
-def handle_open(message):
-    if not os.path.exists(DB_PATH):
-        bot.reply_to(message, "⚠️ Database file not found.")
-        return
 
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT direction, entry, take_profit, stop_loss, timestamp FROM open_calls")
-    rows = c.fetchall()
-    conn.close()
+COMMANDS = {"/start": HELP, "/help": HELP}
+RENDERERS = {"/status": render_status, "/open": render_open, "/stats": render_stats}
 
-    if not rows:
-        bot.reply_to(message, "🟢 No active positions currently open.")
-        return
 
-    response = "📊 **Active Open Positions:**\n\n"
-    for r in rows:
-        response += (
-            f"• **{r[0]} XAU/USD**\n"
-            f"  Entry: `{r[1]}` | TP: `{r[2]}` | SL: `{r[3]}`\n"
-            f"  Opened: {r[4][:16]}\n\n"
-        )
-    bot.reply_to(message, response, parse_mode="Markdown")
+def reply_for(text: str):
+    cmd = (text or "").strip().split()[0].split("@")[0].lower() if (text or "").strip() else ""
+    if cmd in COMMANDS:
+        return COMMANDS[cmd]
+    if cmd in RENDERERS:
+        return RENDERERS[cmd]()
+    return None
 
-@bot.message_handler(commands=['stats'])
-def handle_stats(message):
-    if not os.path.exists(DB_PATH):
-        bot.reply_to(message, "⚠️ Database file not found.")
-        return
 
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT result, SUM(pnl_usd), COUNT(*) FROM history GROUP BY result")
-    stats = c.fetchall()
-    
-    c.execute("SELECT balance FROM account WHERE id = 1")
-    balance = c.fetchone()[0]
-    conn.close()
+def process_pending_commands() -> int:
+    """Answer new commands. Returns how many were handled."""
+    token, allowed_chat = os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
+    if not token or not allowed_chat:
+        return 0
+    offset = int(db.meta_get("tg_offset", "0"))
+    try:
+        r = requests.get(f"https://api.telegram.org/bot{token}/getUpdates",
+                         params={"offset": offset, "timeout": 0}, timeout=15)
+        updates = r.json().get("result", []) if r.status_code == 200 else []
+    except Exception as e:
+        logging.warning("Telegram getUpdates failed: %s", type(e).__name__)
+        return 0
 
-    wins, losses = 0, 0
-    total_pnl = 0.0
+    handled, new_offset = 0, offset
+    for upd in updates:
+        new_offset = max(new_offset, upd["update_id"] + 1)
+        msg = upd.get("message") or {}
+        if str(msg.get("chat", {}).get("id")) != str(allowed_chat):
+            continue                                   # ignore strangers
+        answer = reply_for(msg.get("text", ""))
+        if answer:
+            send_telegram(answer, chat_id=allowed_chat)
+            handled += 1
+    if new_offset != offset:                           # write only on change -> no noisy DB commits
+        db.meta_set("tg_offset", str(new_offset))
+    return handled
 
-    for row in stats:
-        res, pnl, count = row
-        if res == "WIN":
-            wins = count
-            total_pnl += (pnl or 0.0)
-        elif res == "LOSS":
-            losses = count
-            total_pnl += (pnl or 0.0)
 
-    total_trades = wins + losses
-    win_rate = (wins / total_trades * 100) if total_trades > 0 else 0.0
-
-    stats_msg = (
-        f"📈 **All-Time Performance Stats**\n"
-        f"Total Trades: {total_trades}\n"
-        f"Wins: {wins} ✅ | Losses: {losses} ❌\n"
-        f"Win Rate: **{win_rate:.1f}%**\n"
-        f"Net PnL: **${total_pnl:+.2f}**\n"
-        f"Current Balance: **${balance:,.2f}**"
-    )
-    bot.reply_to(message, stats_msg, parse_mode="Markdown")
-
-if __name__ == "__main__":
-    print("Telegram Command Bot started...")
-    bot.infinity_polling()
+if __name__ == "__main__":                             # optional always-on mode
+    logging.basicConfig(level=logging.INFO)
+    db.init_db()
+    while True:
+        process_pending_commands()
+        time.sleep(3)

@@ -1,5 +1,5 @@
-pandas
-numpy
-requests
-google-generativeai
-pyTelegramBotAPI
+pandas>=2.2
+numpy>=1.26
+requests>=2.31
+google-genai>=1.0
+tzdata
