@@ -4,7 +4,10 @@ Fetches real gold candles and asks Gemini about a made-up candidate, so you can 
 work before trusting the scheduled pipeline:   python live_check.py
 """
 import logging
+import os
 from datetime import datetime, timezone
+
+import requests
 
 from ai_engine import evaluate_trade_with_gemini
 from indicators import calculate_adx, calculate_atr, calculate_dynamic_sl_tp, calculate_rsi
@@ -13,7 +16,24 @@ from main import add_emas, drop_forming_candle, fetch_market_data
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
 
 
+def check_telegram():
+    token, chat = os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
+    if not token or not chat:
+        raise SystemExit("TELEGRAM FAIL: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID secret is missing or empty.")
+    me = requests.get(f"https://api.telegram.org/bot{token}/getMe", timeout=15)
+    if me.status_code != 200:
+        raise SystemExit(f"TELEGRAM FAIL: bot token rejected ({me.json().get('description')}). Re-copy it from @BotFather.")
+    print("Telegram token OK: bot is @" + me.json()["result"]["username"])
+    sent = requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                         json={"chat_id": chat, "text": "✅ Trading bot connected. Telegram is set up correctly."}, timeout=15)
+    if sent.status_code != 200:
+        raise SystemExit(f"TELEGRAM FAIL: could not message that chat ID ({sent.json().get('description')}). "
+                         "Open your bot in Telegram and press Start, then check TELEGRAM_CHAT_ID.")
+    print("Telegram message sent. Check your phone.")
+
+
 def main():
+    check_telegram()
     now = datetime.now(timezone.utc)
     df_5m = add_emas(drop_forming_candle(fetch_market_data(interval="5min", outputsize=200), 5, now))
     df_1h = add_emas(drop_forming_candle(fetch_market_data(interval="1h", outputsize=60), 60, now))
