@@ -56,26 +56,35 @@ def process_pending_commands() -> int:
     """Answer new commands. Returns how many were handled."""
     token, allowed_chat = os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
     if not token or not allowed_chat:
+        logging.warning("Telegram commands off: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID secret is missing or empty.")
         return 0
     offset = int(db.meta_get("tg_offset", "0"))
     try:
         r = requests.get(f"https://api.telegram.org/bot{token}/getUpdates",
                          params={"offset": offset, "timeout": 0}, timeout=15)
-        updates = r.json().get("result", []) if r.status_code == 200 else []
+        body = r.json()
+        if r.status_code != 200:
+            logging.warning("Telegram getUpdates failed (HTTP %s): %s", r.status_code, body.get("description"))
+            return 0
+        updates = body.get("result", [])
+        logging.info("Telegram: %d new message(s) waiting.", len(updates))
     except Exception as e:
         logging.warning("Telegram getUpdates failed: %s", type(e).__name__)
         return 0
 
-    handled, new_offset = 0, offset
+    handled, new_offset, ignored = 0, offset, 0
     for upd in updates:
         new_offset = max(new_offset, upd["update_id"] + 1)
         msg = upd.get("message") or {}
         if str(msg.get("chat", {}).get("id")) != str(allowed_chat):
+            ignored += 1
             continue                                   # ignore strangers
         answer = reply_for(msg.get("text", ""))
         if answer:
             send_telegram(answer, chat_id=allowed_chat)
             handled += 1
+    if ignored:
+        logging.warning("Ignored %d message(s) from a chat that does not match TELEGRAM_CHAT_ID.", ignored)
     if new_offset != offset:                           # write only on change -> no noisy DB commits
         db.meta_set("tg_offset", str(new_offset))
     return handled

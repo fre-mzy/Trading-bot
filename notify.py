@@ -16,7 +16,11 @@ def send_telegram(text: str, chat_id=None) -> bool:
         r = requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
                           json={"chat_id": chat_id, "text": text}, timeout=10)
         if r.status_code != 200:
-            logging.error("Telegram rejected message: %s %s", r.status_code, r.text[:200])
+            try:
+                why = r.json().get("description", r.text[:120])
+            except Exception:
+                why = r.text[:120]
+            logging.error("Telegram rejected message (HTTP %s): %s", r.status_code, why)
             return False
         return True
     except Exception as e:  # never let a notification failure kill the pipeline
