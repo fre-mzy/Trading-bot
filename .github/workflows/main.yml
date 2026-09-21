@@ -1,45 +1,53 @@
-name: XAU/USD Automated Trading Pipeline
+name: XAU/USD Paper Trading Pipeline
 
 on:
   workflow_dispatch:
   repository_dispatch:
     types: [run-watcher]
   schedule:
-    - cron: '*/5 * * * *'
+    - cron: '*/5 * * * 0-5'      # Sun-Fri UTC; the code itself skips rollover/closed hours
+
+permissions:
+  contents: write                # needed to commit the SQLite file back
+
+concurrency:                     # never run two cycles at once (they'd fight over the DB)
+  group: trading-pipeline
+  cancel-in-progress: false
 
 jobs:
   run-pipeline:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 5
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: pip
 
-      - name: Install Dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+      - name: Install dependencies
+        run: pip install -r requirements.txt
 
-      - name: Execute Main Pipeline
+      - name: Run pipeline
         env:
           TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          ASSUMED_SPREAD: ${{ vars.ASSUMED_SPREAD || '0.30' }}
         run: python main.py
 
-      - name: Commit & Push SQLite Updates
+      - name: Save paper-trading database
         if: always()
         run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
           git add signals_test.db
-          git diff --quiet && git diff --staged --quiet || (git commit -m "Auto-update SQLite trade logs [skip ci]" && git push)
-          
+          if git diff --cached --quiet; then
+            echo "No database changes."
+          else
+            git commit -m "Update paper trades [skip ci]"
+            git pull --rebase
+            git push
+          fi
